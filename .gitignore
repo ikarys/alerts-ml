@@ -1,0 +1,6 @@
+data/
+*.jsonl
+*.jsonl.gz
+*.tmp
+__pycache__/
+.env
