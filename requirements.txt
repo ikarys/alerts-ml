@@ -1,0 +1,3 @@
+pandas
+scikit-learn
+# optional System 1 fallback (Python 3.10+): laya

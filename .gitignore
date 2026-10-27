@@ -4,3 +4,6 @@ data/
 *.tmp
 __pycache__/
 .env
+out*/
+fake_data/
+fake_tree/
