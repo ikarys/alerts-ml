@@ -1,4 +1,4 @@
-import argparse, json, os, sys
+import argparse, itertools, json, os, re, sys
 from datetime import datetime, timezone
 from collections import Counter
 from features import History, features, label, parse_ts, read_jsonl
@@ -25,6 +25,7 @@ def matches(rule, row):
             if op == "eq" and x != v: return False
             if op == "ne" and x == v: return False
             if op == "in" and x not in v: return False
+            if op == "regex" and not re.fullmatch(v, str(x or "")): return False
             if op == "le" and not (x is not None and x <= v): return False
             if op == "gt" and not (x is not None and x > v): return False
     return True
@@ -38,6 +39,7 @@ def cond_text(c):
     if op == "eq": return f"{f} = {v}"
     if op == "ne": return f"{f} != {v}"
     if op == "in": return f"{f} in {v}"
+    if op == "regex": return f"{f} ~= {v}"
     if op == "le": return f"{f} <= {v}"
     if op == "gt": return f"{f} > {v}"
     return f"{f} {op} {v}"
@@ -72,6 +74,31 @@ def volume_table(df, cols, top=None):
         lambda s: (s == "noise").sum() / len(s) if len(s) else None).reset_index(name="noise_rate")
     t = g.merge(lab, on=cols, how="left").sort_values("n", ascending=False)
     return t.head(top) if top else t
+
+def template_family_candidates(templates, max_vars=2):
+    groups = {}
+    for tpl in templates:
+        parts = str(tpl).split("-")
+        if len(parts) < 5: continue
+        for nvars in range(1, min(max_vars, len(parts) - 4) + 1):
+            for idxs in itertools.combinations(range(len(parts)), nvars):
+                key = tuple("<var>" if i in idxs else p for i, p in enumerate(parts))
+                groups.setdefault(key, set()).add(tpl)
+    out = []
+    for key, vals in groups.items():
+        if len(vals) < 2: continue
+        var_positions = [i for i, p in enumerate(key) if p == "<var>"]
+        if any(len({str(v).split("-")[i] for v in vals}) < 2 for i in var_positions): continue
+        regex = "-".join("[^-]+" if p == "<var>" else re.escape(p) for p in key)
+        out.append((key.count("<var>"), -len(vals), regex, vals))
+    return sorted(out)
+
+def _selftest():
+    vals = ["azure - platform: sql-deadlocks-detected-sqlserver-prd-commun-primary-rundeck",
+            "azure - platform: sql-deadlocks-detected-sqlserver-prp-commun-primary-rundeck"]
+    _, _, rx, grouped = template_family_candidates(vals)[0]
+    assert set(grouped) == set(vals)
+    assert matches({"when": [{"feature": "template", "op": "regex", "value": rx}]}, {"template": vals[0]})
 
 def evaluate_rules(rules, rows):
     assigned = [None] * len(rows)
@@ -135,9 +162,25 @@ def main():
                "label": "useful", "description": "P1 alerts are never classified as noise"}]
     period = df[~test_mask]
     amb_share = (period["label"] == "ambiguous").groupby(period["template"]).mean()
+    family_rules = []
+    for _, _, pattern, vals in template_family_candidates(train["template"].dropna().unique()):
+        rule = {"when": [{"feature": "template", "op": "regex", "value": pattern}]}
+        g = train[train.apply(lambda r: matches(rule, r), axis=1)]
+        n = len(g)
+        if n < args.min_support: continue
+        cnt = g["label"].value_counts()
+        lab, c = cnt.idxmax(), int(cnt.max())
+        amb = period[period.apply(lambda r: matches(rule, r), axis=1)]
+        if len(amb) and (amb["label"] == "ambiguous").mean() > args.max_ambiguous: continue
+        if c / n >= args.min_precision:
+            family_rules.append({"id": f"F{len(family_rules) + 1}", "when": [{"feature": "template", "op": "regex", "value": pattern}],
+                                 "label": lab, "precision": c / n, "support": n, "origin": "template_family",
+                                 "description": f"template ~= {pattern}"})
+
     tpl_rules = []
     for tpl, g in train.groupby("template"):
         if amb_share.get(tpl, 0) > args.max_ambiguous: continue
+        if any(matches(rule, {"template": tpl}) for rule in family_rules): continue
         n = len(g)
         if n < args.min_support: continue
         cnt = g["label"].value_counts()
@@ -148,7 +191,7 @@ def main():
                               "description": f"template = {tpl}"})
 
     tree_rules = []
-    unmatched = train[~train.apply(lambda r: any(matches(rule, r) for rule in tpl_rules), axis=1)]
+    unmatched = train[~train.apply(lambda r: any(matches(rule, r) for rule in family_rules + tpl_rules), axis=1)]
     if len(unmatched) >= args.min_support:
         top_tpl = unmatched["template"].value_counts().head(200).index
         cat = unmatched[["integration", "integration_name", "source", "priority", "team"]].copy()
@@ -201,7 +244,7 @@ def main():
                 stack.append((t.children_left[node], conds + [left]))
                 stack.append((t.children_right[node], conds + [right]))
 
-    rules = tpl_rules + tree_rules
+    rules = family_rules + tpl_rules + tree_rules
     test_rows = test.to_dict("records")
     metrics, _ = evaluate_rules(guards + rules, test_rows)
     for r in rules:
@@ -292,7 +335,7 @@ def main():
         f.write("\n".join(report))
 
     print(f"alerts={len(df)} train={len(train)} test={n_test} ambiguous={int((df['label'] == 'ambiguous').sum())}")
-    print(f"rules={len(final_rules)} template={len(tpl_rules)} tree={len(tree_rules)}")
+    print(f"rules={len(final_rules)} family={len(family_rules)} template={len(tpl_rules)} tree={len(tree_rules)}")
     if n_test:
         print(f"test coverage any={any_matched / n_test:.1%} noise={noise_matched / n_test:.1%} missed_useful={total_missed}")
     else:
@@ -300,4 +343,7 @@ def main():
     print(f"wrote {rules_path}, {laya_path}, {report_path}")
 
 if __name__ == "__main__":
-    main()
+    if "--selftest" in sys.argv:
+        _selftest(); print("analyze selftest OK")
+    else:
+        main()
